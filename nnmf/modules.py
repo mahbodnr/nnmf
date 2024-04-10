@@ -23,7 +23,7 @@ class NNMFLayer(nn.Module):
     def __init__(
         self,
         n_iterations,
-        backward_method="last_iter",
+        backward_method="all_grads",
         h_update_rate=1,
         keep_h=False,
         activate_secure_tensors=True,
@@ -97,7 +97,7 @@ class NNMFLayer(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def _reconstruct(self, h, weight=None):
+    def _reconstruct(self, h, input= None, weight=None):
         raise NotImplementedError
 
     @abstractmethod
@@ -127,7 +127,14 @@ class NNMFLayer(nn.Module):
         Torch jacbian returns a tensor of shape (*self.h.shape, *self.h.shape).
         Should me summed over the second batch dimension.
         """
-        raise NotImplementedError
+        batch_size, *dims = h.shape
+        prod_dims = torch.prod(torch.tensor(dims))
+
+        jacobian = torch.autograd.functional.jacobian(
+            lambda h: h - h * self._get_nnmf_update(input, h)[0],
+            self.h,
+        )
+        return jacobian.sum(-(len(dims) + 1)).reshape(batch_size, prod_dims, prod_dims)
 
     @abstractmethod
     def _check_forward(self, input):
@@ -136,7 +143,7 @@ class NNMFLayer(nn.Module):
         """
 
     def _get_nnmf_update(self, input, h):
-        reconstruction = self._reconstruct(h)
+        reconstruction = self._reconstruct(h, input=input)
         reconstruction = self._secure_tensor(reconstruction)
         if self.normalize_reconstruction:
             reconstruction = F.normalize(
@@ -243,8 +250,8 @@ class NNMFLayer(nn.Module):
                 self.hook = self.h.register_hook(
                     lambda grad: torch.linalg.solve(
                         A=jacobian.transpose(-1, -2),
-                        B=grad.unsqueeze(-1),
-                    )[:, :, 0]
+                        B=grad.reshape(grad.shape[0], -1),
+                    ).reshape(grad.shape)
                 )
 
         else:
@@ -262,7 +269,7 @@ class NNMFLayerDynamicWeight(NNMFLayer):
     def __init__(
         self,
         n_iterations,
-        backward_method="last_iter",
+        backward_method="all_grads",
         h_update_rate=1,
         w_update_rate=1,
         keep_h=False,
@@ -306,7 +313,7 @@ class NNMFDense(NNMFLayer):
         in_features,
         out_features,
         n_iterations,
-        backward_method="last_iter",
+        backward_method="all_grads",
         convergence_threshold=0,
         h_update_rate=1,
         keep_h=False,
@@ -345,7 +352,7 @@ class NNMFDense(NNMFLayer):
         h_shape = x.shape[:-1] + (self.out_features,)
         self.h = F.normalize(torch.ones(h_shape), p=1, dim=1).to(x.device)
 
-    def _reconstruct(self, h, weight=None):
+    def _reconstruct(self, h, input=None, weight=None):
         if weight is None:
             weight = self.weight
         return F.linear(h, weight.t())
@@ -357,7 +364,7 @@ class NNMFDense(NNMFLayer):
 
     def _process_h(self, h):
         h = self._secure_tensor(h)
-        # h = F.normalize(F.relu(h), p=1, dim=1)
+        h = F.normalize(F.relu(h), p=1, dim=1)
         return h
 
     def jacobian(self, input, h):
@@ -371,7 +378,7 @@ class NNMFDense(NNMFLayer):
             "bi, ij, bj, lj -> bil",
             h,
             self.weight,
-            input / self._reconstruct(h).pow(2),
+            input / self._reconstruct(h, input=input).pow(2),
             self.weight,
         )
         return term1 + term2
@@ -397,7 +404,7 @@ class NNMFDenseDynamicWeight(NNMFLayerDynamicWeight, NNMFDense):
         in_features,
         out_features,
         n_iterations,
-        backward_method="last_iter",
+        backward_method="all_grads",
         convergence_threshold=0,
         h_update_rate=1,
         w_update_rate=1,
@@ -440,7 +447,7 @@ class NNMFConv2d(NNMFLayer):
         stride=1,
         dilation=1,
         normalize_channels=False,
-        backward_method="last_iter",
+        backward_method="all_grads",
         convergence_threshold=0,
         h_update_rate=1,
         keep_h=False,
@@ -478,7 +485,9 @@ class NNMFConv2d(NNMFLayer):
             )
 
         self.weight = NonNegativeParameter(
-            torch.rand(out_channels, in_channels, kernel_size, kernel_size)
+            torch.rand(
+                out_channels, in_channels, self.kernel_size[0], self.kernel_size[1]
+            )
         )
 
         self.reset_parameters()
@@ -493,7 +502,7 @@ class NNMFConv2d(NNMFLayer):
             normalized_weight.clamp(min=SECURE_TENSOR_MIN), p=1, dim=(1, 2, 3)
         )
 
-    def _reconstruct(self, h):
+    def _reconstruct(self, h, input=None):
         return F.conv_transpose2d(
             h,
             self.weight,
@@ -510,8 +519,6 @@ class NNMFConv2d(NNMFLayer):
         h = self._secure_tensor(h)
         if self.normalize_channels:
             h = F.normalize(F.relu(h), p=1, dim=1)
-        else:
-            h = self._secure_tensor(h, dim=(1, 2, 3))
         return h
 
     def _reset_h(self, x):
@@ -521,6 +528,14 @@ class NNMFConv2d(NNMFLayer):
             (x.shape[-1] - self.kernel_size[1] + 2 * self.padding[1]) // self.stride[1]
             + 1,
         ]
+        reconstruct_size = [
+            (output_size[0] - 1) * self.stride[0] - 2 * self.padding[0] + 1 * (self.kernel_size[0] - 1)  + 1,
+            (output_size[1] - 1) * self.stride[1] - 2 * self.padding[1] + 1 * (self.kernel_size[1] - 1)  + 1,
+        ]
+        if reconstruct_size != list(x.shape[-2:]):
+            raise ValueError(
+                f"Reconstruction size {reconstruct_size} does not match input size {list(x.shape[-2:])}. Use ForwardNNMFConv2d instead"
+            )
         self.h = torch.ones(x.shape[0], self.out_channels, *output_size).to(x.device)
 
     def _check_forward(self, input):
@@ -532,47 +547,24 @@ class NNMFConv2d(NNMFLayer):
 
 
 class ForwardNNMF(NNMFLayer):
-    def _nnmf_iteration(self, input):
-        reconstruction = torch.autograd.functional.vjp(
+    def _reconstruct(self, h, input, weight=None):
+        return  torch.autograd.functional.vjp(
             self._forward,
             input,
             self.h,
             create_graph=True,
         )[1]
-        reconstruction = self._secure_tensor(reconstruction)
-        if self.normalize_reconstruction:
-            reconstruction = F.normalize(
-                reconstruction, p=1, dim=self.normalize_reconstruction_dim, eps=1e-20
-            )
-        nnmf_update = input / reconstruction
-        new_h = self.h * self._forward(nnmf_update)
-        if self.h_update_rate == 1:
-            h = new_h
-        else:
-            h = self.h_update_rate * new_h + (1 - self.h_update_rate) * self.h
-        return self._process_h(h), self._process_reconstruction(reconstruction)
-
 
 class BackwardNNMF(NNMFLayer):
-    def _nnmf_iteration(self, input):
-        reconstruction = self._reconstruct(self.h)
-        reconstruction = self._secure_tensor(reconstruction)
-        if self.normalize_reconstruction:
-            reconstruction = F.normalize(
-                reconstruction, p=1, dim=self.normalize_reconstruction_dim, eps=1e-20
-            )
-        nnmf_update = input / (reconstruction + 1e-20)
-
-        h_update = torch.autograd.functional.vjp(
+    def _forward(self, nnmf_update):
+        return torch.autograd.functional.vjp(
             self._reconstruct,
             self.h,
             nnmf_update,
             create_graph=True,
         )[1]
 
-        new_h = self.h * h_update
-        if self.h_update_rate == 1:
-            h = new_h
-        else:
-            h = self.h_update_rate * new_h + (1 - self.h_update_rate) * self.h
-        return self._process_h(h), self._process_reconstruction(reconstruction)
+class ForwardNNMFConv2d(ForwardNNMF, NNMFConv2d):
+    """
+    Forward NNMF for Conv2d layer
+    """
