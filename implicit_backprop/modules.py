@@ -148,7 +148,6 @@ class NNMFLayer(nn.Module):
         return input
 
     def forward(self, input):
-        self.normalize_weights()
         self._check_forward(input)
         input = self._prepare_input(input)
 
@@ -196,12 +195,11 @@ class NNMFDense(NNMFLayer):
         self.out_features = out_features
         self.n_iterations = n_iterations
 
-        self.weight = torch.nn.Parameter(torch.rand(out_features, in_features))
+        self.weight = torch.nn.Parameter(torch.Tensor(out_features, in_features))
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.uniform_(self.weight, a=0, b=1)
-        self.weight.data = F.normalize(self.weight.data, p=1, dim=1)
 
     def _reset_h(self, x):
         h_shape = x.shape[:-1] + (self.out_features,)
@@ -219,23 +217,11 @@ class NNMFDense(NNMFLayer):
 
     def _process_h(self, h):
         h = self._secure_tensor(h)
-        h = F.normalize(F.relu(h), p=1, dim=1)
+        # h = F.normalize(F.relu(h), p=1, dim=1)
         return h
 
     def _check_forward(self, input):
-        assert self.weight.sum(1, keepdim=True).allclose(
-            torch.ones_like(self.weight), atol=COMPARISSON_TOLERANCE
-        ), self.weight.sum(1)
-        assert (self.weight >= 0).all(), self.weight.min()
         assert (input >= 0).all(), input.min()
-
-    @torch.no_grad()
-    def normalize_weights(self):
-        # weights may contain negative values after optimizer updates
-        normalized_weight = F.normalize(self.weight.data, p=1, dim=-1)
-        pos_weight = normalized_weight.clamp(min=SECURE_TENSOR_MIN)
-        self.weight.data = F.normalize(pos_weight, p=1, dim=-1)
-
 
 if __name__ == "__main__":
     layer = NNMFDense(in_features= 5, out_features= 4, n_iterations= 2).cuda()
