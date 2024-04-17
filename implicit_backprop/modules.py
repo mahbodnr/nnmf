@@ -10,6 +10,8 @@ from torch.nn.modules.utils import _pair
 
 from implicit_backprop.autograd import ImplicitGradient
 
+import matplotlib.pyplot as plt
+
 COMPARISSON_TOLERANCE = 1e-5
 SECURE_TENSOR_MIN = 1e-5
 
@@ -71,10 +73,6 @@ class NNMFLayer(nn.Module):
         return t.clamp_min(SECURE_TENSOR_MIN) if self.activate_secure_tensors else t
 
     @abstractmethod
-    def normalize_weights(self):
-        raise NotImplementedError
-
-    @abstractmethod
     def _reset_h(self, x):
         raise NotImplementedError
 
@@ -95,30 +93,6 @@ class NNMFLayer(nn.Module):
         return reconstruction
 
     @abstractmethod
-    def jacobian(self, input, h):
-        """
-        Compute the jacobian of the forward pass with respect to h* (at the fixed point)
-
-        Can also be computed with torch.autograd.functional.jacobian as:
-            jacobian = torch.autograd.functional.jacobian(
-                    lambda h: h - h * self._get_nnmf_update(input, h)[0],
-                    self.h,
-                )
-            jacobian = jacobian.sum(<second batch dimension>)
-
-        Torch jacbian returns a tensor of shape (*self.h.shape, *self.h.shape).
-        Should me summed over the second batch dimension.
-        """
-        batch_size, *dims = h.shape
-        prod_dims = torch.prod(torch.tensor(dims))
-
-        jacobian = torch.autograd.functional.jacobian(
-            lambda h: h - h * self._get_nnmf_update(input, h)[0],
-            self.h,
-        )
-        return jacobian.sum(-(len(dims) + 1)).reshape(batch_size, prod_dims, prod_dims)
-
-    @abstractmethod
     def _check_forward(self, input):
         """
         Check that the forward pass is valid
@@ -133,14 +107,14 @@ class NNMFLayer(nn.Module):
             )
         return self._forward(input / reconstruction, weight=weight), reconstruction
 
-    def _nnmf_iteration(self, input, weight=None):
-        nnmf_update, reconstruction = self._get_nnmf_update(input, self.h, weight=weight)
-        new_h = self.h * nnmf_update
+    def _nnmf_iteration(self, input, h, weight=None):
+        nnmf_update, reconstruction = self._get_nnmf_update(input, h, weight=weight)
+        new_h = h * nnmf_update
         if self.h_update_rate == 1:
             h = new_h
         else:
-            h = self.h_update_rate * new_h + (1 - self.h_update_rate) * self.h
-        return self._process_h(h), self._process_reconstruction(reconstruction)
+            h = self.h_update_rate * new_h + (1 - self.h_update_rate) * h
+        return self._process_h(h), self._process_reconstruction(reconstruction), nnmf_update
 
     def _prepare_input(self, input):
         if self.normalize_input:
@@ -199,7 +173,9 @@ class NNMFDense(NNMFLayer):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.uniform_(self.weight, a=0, b=1)
+        nn.init.uniform_(self.weight, a=-1, b=1)
+        # nn.init.uniform_(self.weight, a=0, b=1)
+        # self.weight.data = F.normalize(self.weight.data, p=1, dim=1)
 
     def _reset_h(self, x):
         h_shape = x.shape[:-1] + (self.out_features,)
@@ -207,17 +183,19 @@ class NNMFDense(NNMFLayer):
 
     def _reconstruct(self, h, input=None, weight=None):
         if weight is None:
+            print("weight is None! Using self.weight")
             weight = self.weight
         return F.linear(h, weight.t())
 
     def _forward(self, nnmf_update, weight=None):
         if weight is None:
+            print("weight is None! Using self.weight")
             weight = self.weight
         return F.linear(nnmf_update, weight)
 
     def _process_h(self, h):
         h = self._secure_tensor(h)
-        # h = F.normalize(F.relu(h), p=1, dim=1)
+        h = F.normalize(F.relu(h), p=1, dim=1)
         return h
 
     def _check_forward(self, input):
