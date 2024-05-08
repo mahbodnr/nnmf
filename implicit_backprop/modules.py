@@ -98,6 +98,10 @@ class NNMFLayer(nn.Module):
         Check that the forward pass is valid
         """
 
+    @abstractmethod
+    def _normalize_weight(self):
+        pass
+
     def _get_nnmf_update(self, input, h, weight=None):
         reconstruction = self._reconstruct(h, input=input, weight=weight)
         reconstruction = self._secure_tensor(reconstruction)
@@ -130,6 +134,8 @@ class NNMFLayer(nn.Module):
 
         if (not self.keep_h) or (self.h is None):
             self._reset_h(input)
+
+        self._normalize_weight()
 
         self.h = ImplicitGradient.apply(input, self.weight, self.h, self.n_iterations, self._nnmf_iteration)
 
@@ -173,8 +179,15 @@ class NNMFDense(NNMFLayer):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.uniform_(self.weight, a=-1, b=1)
-        # nn.init.uniform_(self.weight, a=0, b=1)
+        # nn.init.uniform_(self.weight, a=-1, b=1)
+        nn.init.uniform_(self.weight, a=0, b=1)
+        self.weight.data = F.normalize(self.weight.data, p=1, dim=1)
+
+    def _normalize_weight(self):
+        pass
+        # print(self.weight.sum(1))
+        # self.weight.data = F.normalize(self.weight.data, p=1, dim=1)
+        # self.weight.data = self._secure_tensor(self.weight.data)
         # self.weight.data = F.normalize(self.weight.data, p=1, dim=1)
 
     def _reset_h(self, x):

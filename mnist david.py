@@ -1,7 +1,5 @@
 import torch
-# from implicit_backprop.modules import NNMFDense
-from nnmf.modules import NNMFDense
-# from torch.nn import Linear as NNMFDense
+from davidnnmf_old.NNMFLinear import NNMFLinear as NNMFDense
 import torchvision
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -15,16 +13,22 @@ class Net(nn.Module):
         super(Net, self).__init__()
         iterations = 100
         self.nnmf1 = NNMFDense(
-            in_features=784,
-            out_features=100,
-            n_iterations=iterations,
-            backward_method="david",
+            number_of_input_neurons=784,
+            number_of_neurons=100,
+            number_of_iterations=iterations,
+            weight_noise_range= [0.0, 1.0],
+            device=torch.device("cuda"),
+            dtype=torch.float32,
+            threshold_clamp= 1e-5/100,
         )
         self.nnmf2 = NNMFDense(
-            in_features=100,
-            out_features=10,
-            n_iterations=iterations,
-            backward_method="david",
+            number_of_input_neurons=100,
+            number_of_neurons=10,
+            number_of_iterations=iterations,
+            weight_noise_range= [0.0, 1.0],
+            device=torch.device("cuda"),
+            dtype=torch.float32,
+            threshold_clamp= 1e-5/10,
         )
 
     def forward(self, x):
@@ -46,7 +50,6 @@ net = Net().cuda()
 # define loss function
 criterion = nn.CrossEntropyLoss()
 optimizer = Adam(net.parameters(), lr=0.00001)
-# optimizer = torch.optim.AdamW(net.parameters(), lr=0.001)
 # optimizer = torch.optim.SGD(net.parameters(), lr=0.001)
 corrects = 0
 items = 0
@@ -74,7 +77,7 @@ for epoch in range(10):
         # inputs = inputs + 0.1
         outputs = net(inputs)
         # print(net.nnmf2.weight)
-        # print(net.nnmf1.weight.sum(1))
+        #print(net.nnmf1.weight.sum(1))
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()

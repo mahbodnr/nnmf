@@ -14,6 +14,7 @@ from torch.nn.modules.utils import _pair
 
 from nnmf.utils import PowerSoftmax
 from nnmf.parameters import NonNegativeParameter
+from nnmf.autograd import FunctionalNNMFLinear, FunctionalNNMFConv2d
 
 COMPARISSON_TOLERANCE = 1e-5
 SECURE_TENSOR_MIN = 1e-5
@@ -29,6 +30,8 @@ class NNMFLayer(nn.Module):
         activate_secure_tensors=True,
         return_reconstruction=False,
         convergence_threshold=0,
+        phantom_damping_factor=0.5,
+        unrolling_steps=5,
         normalize_input=False,
         normalize_input_dim=None,
         normalize_reconstruction=False,
@@ -45,7 +48,9 @@ class NNMFLayer(nn.Module):
             "last_iter",
             "implicit",
             "all_grads",
-        ], f"backward_method must be one of 'last_iter', 'implicit', 'all_grads', got {backward_method}"
+            "phantom_unrolling",
+            "david",
+        ], f"backward_method must be one of 'last_iter', 'implicit', 'all_grads', 'phantom_unrolling', 'david', got {backward_method}"
         if not activate_secure_tensors:
             warnings.warn(
                 "[WARNING] 'activate_secure_tensors' is False! This may lead to numerical instability."
@@ -59,7 +64,8 @@ class NNMFLayer(nn.Module):
         self.convergence_threshold = convergence_threshold
 
         self.backward_method = backward_method
-
+        self.phantom_damping_factor = phantom_damping_factor
+        self.unrolling_steps = unrolling_steps
         self.normalize_input = normalize_input
         self.normalize_input_dim = normalize_input_dim
         if self.normalize_input and self.normalize_input_dim is None:
@@ -97,7 +103,7 @@ class NNMFLayer(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def _reconstruct(self, h, input= None, weight=None):
+    def _reconstruct(self, h, input=None, weight=None):
         raise NotImplementedError
 
     @abstractmethod
@@ -254,6 +260,53 @@ class NNMFLayer(nn.Module):
                     ).reshape(grad.shape)
                 )
 
+        elif self.backward_method == "phantom_unrolling":
+            with torch.no_grad():
+                self.forward_iterations = 0
+                no_grad_iterations = (
+                    self.n_iterations if not self.training else self.n_iterations - 1
+                )
+                for i in range(no_grad_iterations):
+                    self.forward_iterations = i + 1
+                    new_h, self.reconstruction = self._nnmf_iteration(input)
+                    self.convergence.append(F.mse_loss(new_h, self.h))
+                    self.reconstruction_mse.append(
+                        F.mse_loss(self.reconstruction, input)
+                    )
+                    self.h = new_h
+                    if (
+                        self.convergence_threshold > 0
+                        and self.convergence[-1] < self.convergence_threshold
+                    ):
+                        break
+
+            if self.training:
+                for _ in range(self.unrolling_steps):
+                    self.forward_iterations += 1
+                    new_h, new_reconstruction = self._nnmf_iteration(input)
+                    new_h = (
+                        self.phantom_damping_factor * new_h
+                        + (1 - self.phantom_damping_factor) * self.h
+                    )
+                    new_reconstruction = (
+                        self.phantom_damping_factor * new_reconstruction
+                        + (1 - self.phantom_damping_factor) * self.reconstruction
+                    )
+                    self.convergence.append(F.mse_loss(new_h, self.h))
+                    self.reconstruction_mse.append(
+                        F.mse_loss(self.reconstruction, input)
+                    )
+                    self.h = new_h
+                    self.reconstruction = new_reconstruction
+
+        elif self.backward_method == "david":
+            self.h = self.david_backprop(
+                input,
+                self.h,
+                self.n_iterations,
+            )
+            self.reconstruction = self._reconstruct(self.h, input=input)
+
         else:
             raise NotImplementedError(
                 f"backward_method {self.backward_method} not implemented"
@@ -263,6 +316,10 @@ class NNMFLayer(nn.Module):
             return self.h, self.reconstruction
         else:
             return self.h
+
+    @abstractmethod
+    def david_backprop(self, input, h, n_iterations):
+        raise NotImplementedError("David backprop not implemented for this layer")
 
 
 class NNMFLayerDynamicWeight(NNMFLayer):
@@ -397,6 +454,9 @@ class NNMFDense(NNMFLayer):
         pos_weight = normalized_weight.clamp(min=SECURE_TENSOR_MIN)
         self.weight.data = F.normalize(pos_weight, p=1, dim=-1)
 
+    def david_backprop(self, input, h, n_iterations):
+        return FunctionalNNMFLinear.apply(input, self.weight, h, n_iterations, self._reconstruct, self._forward)
+
 
 class NNMFDenseDynamicWeight(NNMFLayerDynamicWeight, NNMFDense):
     def __init__(
@@ -489,7 +549,7 @@ class NNMFConv2d(NNMFLayer):
                 out_channels, in_channels, self.kernel_size[0], self.kernel_size[1]
             )
         )
-
+        self.convolution_contribution_map = None
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -502,17 +562,21 @@ class NNMFConv2d(NNMFLayer):
             normalized_weight.clamp(min=SECURE_TENSOR_MIN), p=1, dim=(1, 2, 3)
         )
 
-    def _reconstruct(self, h, input=None):
+    def _reconstruct(self, h, input=None, weight=None):
+        if weight is None:
+            weight = self.weight
         return F.conv_transpose2d(
             h,
-            self.weight,
+            weight,
             padding=self.padding,
             stride=self.stride,
         )
 
-    def _forward(self, nnmf_update):
+    def _forward(self, nnmf_update, weight=None):
+        if weight is None:
+            weight = self.weight
         return F.conv2d(
-            nnmf_update, self.weight, padding=self.padding, stride=self.stride
+            nnmf_update, weight, padding=self.padding, stride=self.stride
         )
 
     def _process_h(self, h):
@@ -522,21 +586,27 @@ class NNMFConv2d(NNMFLayer):
         return h
 
     def _reset_h(self, x):
-        output_size = [
+        self.output_size = [
             (x.shape[-2] - self.kernel_size[0] + 2 * self.padding[0]) // self.stride[0]
             + 1,
             (x.shape[-1] - self.kernel_size[1] + 2 * self.padding[1]) // self.stride[1]
             + 1,
         ]
         reconstruct_size = [
-            (output_size[0] - 1) * self.stride[0] - 2 * self.padding[0] + 1 * (self.kernel_size[0] - 1)  + 1,
-            (output_size[1] - 1) * self.stride[1] - 2 * self.padding[1] + 1 * (self.kernel_size[1] - 1)  + 1,
+            (self.output_size[0] - 1) * self.stride[0]
+            - 2 * self.padding[0]
+            + 1 * (self.kernel_size[0] - 1)
+            + 1,
+            (self.output_size[1] - 1) * self.stride[1]
+            - 2 * self.padding[1]
+            + 1 * (self.kernel_size[1] - 1)
+            + 1,
         ]
         if reconstruct_size != list(x.shape[-2:]):
             raise ValueError(
                 f"Reconstruction size {reconstruct_size} does not match input size {list(x.shape[-2:])}. Use ForwardNNMFConv2d instead"
             )
-        self.h = torch.ones(x.shape[0], self.out_channels, *output_size).to(x.device)
+        self.h = torch.ones(x.shape[0], self.out_channels, *self.output_size).to(x.device)
 
     def _check_forward(self, input):
         assert self.weight.sum((1, 2, 3), keepdim=True).allclose(
@@ -545,15 +615,36 @@ class NNMFConv2d(NNMFLayer):
         assert (self.weight >= 0).all(), self.weight.min()
         assert (input >= 0).all(), input.min()
 
+    def david_backprop(self, input, h, n_iterations):
+        if self.convolution_contribution_map is None:
+            # TODO: stride, padding, dilation
+            self.convolution_contribution_map = torch.nn.functional.conv_transpose2d(
+                torch.full(
+                    (1, self.out_channels, *self.output_size),
+                    1.0 / float(self.output_size[1]),
+                    dtype=self.weight.dtype,
+                    device=self.weight.device,
+                ),
+                torch.ones_like(self.weight),
+                stride=1,
+                padding=0,
+                dilation=1,
+            ) * (
+                (input.shape[1] * input.shape[2] * input.shape[3])
+                / (self.weight.shape[1] * self.weight.shape[2] * self.weight.shape[3])
+            )
+        return FunctionalNNMFConv2d.apply(input, self.weight, h, n_iterations, self._reconstruct, self._forward, self.convolution_contribution_map)
+
 
 class ForwardNNMF(NNMFLayer):
     def _reconstruct(self, h, input, weight=None):
-        return  torch.autograd.functional.vjp(
+        return torch.autograd.functional.vjp(
             self._forward,
             input,
             self.h,
             create_graph=True,
         )[1]
+
 
 class BackwardNNMF(NNMFLayer):
     def _forward(self, nnmf_update):
@@ -563,6 +654,7 @@ class BackwardNNMF(NNMFLayer):
             nnmf_update,
             create_graph=True,
         )[1]
+
 
 class ForwardNNMFConv2d(ForwardNNMF, NNMFConv2d):
     """

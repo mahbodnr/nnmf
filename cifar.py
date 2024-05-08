@@ -1,7 +1,6 @@
 import torch
-# from implicit_backprop.modules import NNMFDense
-from nnmf.modules import NNMFDense
-# from torch.nn import Linear as NNMFDense
+from nnmf.modules import NNMFConv2d
+# from torch.nn import Conv2d as NNMFConv2d
 import torchvision
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -14,30 +13,39 @@ class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
         iterations = 100
-        self.nnmf1 = NNMFDense(
-            in_features=784,
-            out_features=100,
-            n_iterations=iterations,
-            backward_method="david",
+        backward_method = "david"
+        self.nnmf1 = NNMFConv2d(
+            in_channels= 3,
+            out_channels = 32,
+            kernel_size = 3,
+            n_iterations = iterations,
+            backward_method=backward_method,
         )
-        self.nnmf2 = NNMFDense(
-            in_features=100,
-            out_features=10,
+        self.nnmf2 = NNMFConv2d(
+            in_channels= 32,
+            out_channels = 64,
+            kernel_size = 3,
             n_iterations=iterations,
-            backward_method="david",
+            backward_method=backward_method,
         )
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.out = nn.Linear(64 * 6 * 6, 10)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
         x = self.nnmf1(x)
+        x = self.pool2(x)
         x = self.nnmf2(x)
+        x = self.pool2(x)
+        x = x.view(x.size(0), -1)
+        x = self.out(x)
+    
         return x
 
-# load mnist data
+# load cifar data
 transform = transforms.Compose([transforms.ToTensor()])
-trainset = torchvision.datasets.MNIST(root='~/data', train=True, download=False, transform=transform)
+trainset = torchvision.datasets.CIFAR10(root='~/data', train=True, download=False, transform=transform)
 trainloader = DataLoader(trainset, batch_size=64, shuffle=True)
-testset = torchvision.datasets.MNIST(root='~/data', train=False, download=False, transform=transform)
+testset = torchvision.datasets.CIFAR10(root='~/data', train=False, download=False, transform=transform)
 testloader = DataLoader(testset, batch_size=64, shuffle=False)
 
 # create model
@@ -45,9 +53,8 @@ net = Net().cuda()
 
 # define loss function
 criterion = nn.CrossEntropyLoss()
-optimizer = Adam(net.parameters(), lr=0.00001)
-# optimizer = torch.optim.AdamW(net.parameters(), lr=0.001)
-# optimizer = torch.optim.SGD(net.parameters(), lr=0.001)
+optimizer = Adam(net.parameters(), lr=0.001)
+
 corrects = 0
 items = 0
 
@@ -57,7 +64,6 @@ def evaluate():
     for i, data in tqdm(enumerate(testloader), total=len(testloader)):
         inputs, labels = data
         inputs, labels = inputs.cuda(), labels.cuda()
-        inputs = inputs.view(inputs.size(0), -1)
         outputs = net(inputs)
         _, predicted = torch.max(outputs, 1)
         corrects += (predicted == labels).sum().item()
@@ -69,12 +75,8 @@ for epoch in range(10):
     for i, data in tqdm(enumerate(trainloader), total=len(trainloader)):
         inputs, labels = data
         inputs, labels = inputs.cuda(), labels.cuda()
-        inputs = inputs.view(inputs.size(0), -1)
         optimizer.zero_grad()
-        # inputs = inputs + 0.1
         outputs = net(inputs)
-        # print(net.nnmf2.weight)
-        # print(net.nnmf1.weight.sum(1))
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
@@ -86,8 +88,4 @@ for epoch in range(10):
             print(f'Epoch: {epoch}, Iteration: {i}, Loss: {loss.item()}, Accuracy: {accuracy}')
             corrects = 0
             items = 0
-            # plt.hist(net.nnmf1.weight.cpu().detach().numpy().flatten(), bins=100, alpha=0.5, label="NNMF1")
-            # plt.hist(net.nnmf2.weight.cpu().detach().numpy().flatten(), bins=100, alpha=0.5, label="NNMF2")
-            # plt.legend()
-            # plt.show()
     evaluate()
