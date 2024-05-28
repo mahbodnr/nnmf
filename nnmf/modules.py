@@ -155,11 +155,13 @@ class NNMFLayer(nn.Module):
             reconstruction = F.normalize(
                 reconstruction, p=1, dim=self.normalize_reconstruction_dim, eps=1e-20
             )
-        return self._forward(input / reconstruction), reconstruction
+        return self._forward(input / reconstruction), reconstruction # MSE model
+        # return self._forward(input - reconstruction), reconstruction
 
     def _nnmf_iteration(self, input):
         nnmf_update, reconstruction = self._get_nnmf_update(input, self.h)
         new_h = self.h * nnmf_update
+        # new_h = self.h + nnmf_update # MSE model
         if self.h_update_rate == 1:
             h = new_h
         else:
@@ -660,3 +662,87 @@ class ForwardNNMFConv2d(ForwardNNMF, NNMFConv2d):
     """
     Forward NNMF for Conv2d layer
     """
+
+
+class LocalNNMFLayer(NNMFLayer):
+    def __init__(
+        self,
+        n_iterations,
+        backward_method="all_grads",
+        h_update_rate=1,
+        keep_h=False,
+        activate_secure_tensors=True,
+        return_reconstruction=False,
+        convergence_threshold=0,
+        phantom_damping_factor=0.5,
+        unrolling_steps=5,
+        normalize_input=False,
+        normalize_input_dim=None,
+        normalize_reconstruction=False,
+        normalize_reconstruction_dim=None,
+    ):
+        super().__init__(
+            n_iterations,
+            backward_method,
+            h_update_rate,
+            keep_h,
+            activate_secure_tensors,
+            return_reconstruction,
+            convergence_threshold=convergence_threshold,
+            phantom_damping_factor=phantom_damping_factor,
+            unrolling_steps=unrolling_steps,
+            normalize_input=normalize_input,
+            normalize_input_dim=normalize_input_dim,
+            normalize_reconstruction=normalize_reconstruction,
+            normalize_reconstruction_dim=normalize_reconstruction_dim,
+        )
+
+    @abstractmethod
+    def update(self):
+        raise NotImplementedError
+
+
+class LocalNNMFDense(LocalNNMFLayer, NNMFDense):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        n_iterations,
+        w_update_rate=1,
+        h_update_rate=1,
+        keep_h=False,
+        activate_secure_tensors=True,
+        return_reconstruction=False,
+        convergence_threshold=0,
+        normalize_input=False,
+        normalize_input_dim=None,
+        normalize_reconstruction=False,
+        normalize_reconstruction_dim=None,
+    ):
+        NNMFDense.__init__(
+            self,
+            in_features=in_features,
+            out_features=out_features,
+            n_iterations=n_iterations,
+            h_update_rate=h_update_rate,
+            keep_h=keep_h,
+            activate_secure_tensors=activate_secure_tensors,
+            return_reconstruction=return_reconstruction,
+            convergence_threshold=convergence_threshold,
+            normalize_input=normalize_input,
+            normalize_input_dim=normalize_input_dim,
+            normalize_reconstruction=normalize_reconstruction,
+            normalize_reconstruction_dim=normalize_reconstruction_dim,
+        )
+        self.weight = NonNegativeParameter(torch.rand(out_features, in_features), requires_grad=False)
+        self.w_update_rate = w_update_rate
+
+    @torch.no_grad()
+    def update(self):
+        nnmf_update = self.prepared_input / (self.reconstruction + 1e-20)
+        new_weight = self.weight.data * F.linear(self.h.t(), nnmf_update.t())
+        self.weight.data = (
+            self.w_update_rate * new_weight
+            + (1 - self.w_update_rate) * self.weight.data
+        )
+        self.normalize_weights()

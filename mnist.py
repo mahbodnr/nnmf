@@ -18,19 +18,21 @@ class Net(nn.Module):
             in_features=784,
             out_features=100,
             n_iterations=iterations,
-            backward_method="david",
+            backward_method="all_grads",
         )
         self.nnmf2 = NNMFDense(
             in_features=100,
             out_features=10,
             n_iterations=iterations,
-            backward_method="david",
+            backward_method="all_grads",
         )
+        # self.out = nn.Linear(100, 10)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
         x = self.nnmf1(x)
         x = self.nnmf2(x)
+        # x = self.out(x)
         return x
 
 # load mnist data
@@ -73,7 +75,8 @@ for epoch in range(10):
         optimizer.zero_grad()
         # inputs = inputs + 0.1
         outputs = net(inputs)
-        # print(net.nnmf2.weight)
+        # print(net.nnmf1.reconstruction_mse)
+        # print(net.nnmf2.reconstruction_mse)
         # print(net.nnmf1.weight.sum(1))
         loss = criterion(outputs, labels)
         loss.backward()
@@ -81,7 +84,7 @@ for epoch in range(10):
         _, predicted = torch.max(outputs, 1)
         corrects += (predicted == labels).sum().item()
         items += labels.size(0)
-        if i % 100 == 99:
+        if i % 100 == 0:
             accuracy = corrects / items
             print(f'Epoch: {epoch}, Iteration: {i}, Loss: {loss.item()}, Accuracy: {accuracy}')
             corrects = 0
@@ -90,4 +93,19 @@ for epoch in range(10):
             # plt.hist(net.nnmf2.weight.cpu().detach().numpy().flatten(), bins=100, alpha=0.5, label="NNMF2")
             # plt.legend()
             # plt.show()
+            plt.figure(figsize=(20, 10))
+            plt.suptitle(f"add - Iteration: {i}")
+            plt.subplot(2, 2, 1)
+            plt.plot(torch.tensor(net.nnmf1.reconstruction_mse).detach().cpu().numpy(),)
+            plt.title("NNMF1 Reconstruction MSE")
+            plt.subplot(2, 2, 2)
+            plt.plot(torch.tensor(net.nnmf2.reconstruction_mse).detach().cpu().numpy(),)
+            plt.title("NNMF2 Reconstruction MSE")
+            plt.subplot(2, 2, 3)
+            plt.plot(torch.tensor(net.nnmf1.convergence).detach().cpu().numpy(), )
+            plt.title("NNMF1 Convergence")
+            plt.subplot(2, 2, 4)
+            plt.plot(torch.tensor(net.nnmf2.convergence).detach().cpu().numpy(),)
+            plt.title("NNMF2 Convergence")
+            plt.show()
     evaluate()
