@@ -13,7 +13,7 @@ class FunctionalNNMFLinear(torch.autograd.Function):
     ) -> torch.Tensor:
 
         for _ in range(number_of_iterations):
-            reconstruction = reconstruct_fun(h, input=input, weight=weight)
+            reconstruction = reconstruct_fun(h, weight=weight)
             h *= forward_fun((input / (reconstruction + 1e-20)), weight=weight)
             torch.nn.functional.normalize(h, dim=-1, p=1, out=h, eps=1e-20)
 
@@ -69,6 +69,8 @@ class FunctionalNNMFConv2d(torch.autograd.Function):
         reconstruct_fun: callable,
         forward_fun: callable,
         convolution_contribution_map: torch.Tensor,
+        stride: int,
+        padding: int,
     ) -> torch.Tensor:
 
         input *= convolution_contribution_map
@@ -82,6 +84,8 @@ class FunctionalNNMFConv2d(torch.autograd.Function):
             weight,
             h,
             reconstruction,
+            torch.tensor(stride),
+            torch.tensor(padding),
         )
 
         return h
@@ -93,6 +97,8 @@ class FunctionalNNMFConv2d(torch.autograd.Function):
             weight,
             h,
             reconstruction,
+            stride,
+            padding,
         ) = ctx.saved_tensors
 
         positive_weights = weight # TODO: add exp weight
@@ -103,8 +109,8 @@ class FunctionalNNMFConv2d(torch.autograd.Function):
             big_r: torch.Tensor = torch.nn.functional.conv_transpose2d(
                 h,
                 positive_weights,
-                stride=1,
-                padding=0,
+                stride=stride.item(),
+                padding=padding.item(),
                 dilation=1,
             )
             factor_x_div_r: torch.Tensor = input / (big_r + 10e-20)
@@ -112,8 +118,8 @@ class FunctionalNNMFConv2d(torch.autograd.Function):
             grad_input = torch.nn.functional.conv_transpose2d(
                 (h * grad_output),
                 positive_weights,
-                stride=1,
-                padding=0,
+                stride=stride.item(),
+                padding=padding.item(),
                 dilation=1,
             ) / (big_r + 10e-20)
             del big_r
@@ -130,5 +136,5 @@ class FunctionalNNMFConv2d(torch.autograd.Function):
             # grad_weight *= positive_weights
             # grad_weight -= positive_weights * grad_weight.sum(dim=0, keepdim=True)
 
-        return grad_input, grad_weights, None, None, None, None, None
+        return grad_input, grad_weights, None, None, None, None, None, None, None
 
