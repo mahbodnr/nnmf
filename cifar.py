@@ -12,14 +12,16 @@ from matplotlib import pyplot as plt
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        iterations = 100
-        backward_method = "david"
+        iterations = 25
+        backward_method = "all_grads"
+        norm_chans = True
         self.nnmf1 = NNMFConv2d(
             in_channels= 3,
             out_channels = 32,
             kernel_size = 3,
             n_iterations = iterations,
             backward_method=backward_method,
+            normalize_channels=norm_chans,
         )
         self.nnmf2 = NNMFConv2d(
             in_channels= 32,
@@ -27,6 +29,7 @@ class Net(nn.Module):
             kernel_size = 3,
             n_iterations=iterations,
             backward_method=backward_method,
+            normalize_channels=norm_chans,
         )
         self.pool2 = nn.MaxPool2d(2, 2)
         # self.out = nn.Linear(64 * 6 * 6, 10)
@@ -36,9 +39,10 @@ class Net(nn.Module):
             kernel_size = 1,
             n_iterations=iterations,
             backward_method=backward_method,
-            normalize_channels=False,
-            normalize_input=False,
-            normalize_reconstruction=False,
+            normalize_channels=norm_chans,
+            # normalize_channels=False,
+            # normalize_input=False,
+            # normalize_reconstruction=False,
         )
 
     def forward(self, x):
@@ -50,22 +54,21 @@ class Net(nn.Module):
         # x = x.view(x.size(0), -1)
         x = self.out(x)
         x = x.view(x.size(0), -1)
-    
         return x
 
 # load cifar data
 transform = transforms.Compose([transforms.ToTensor()])
 trainset = torchvision.datasets.CIFAR10(root='~/data', train=True, download=False, transform=transform)
-trainloader = DataLoader(trainset, batch_size=64, shuffle=True)
+trainloader = DataLoader(trainset, batch_size=256, shuffle=True)
 testset = torchvision.datasets.CIFAR10(root='~/data', train=False, download=False, transform=transform)
-testloader = DataLoader(testset, batch_size=64, shuffle=False)
+testloader = DataLoader(testset, batch_size=1024, shuffle=False)
 
 # create model
 net = Net().cuda()
 
 # define loss function
 criterion = nn.CrossEntropyLoss()
-optimizer = Adam(net.parameters(), lr=0.1)
+optimizer = Adam(net.parameters(), lr=0.001)
 
 corrects = 0
 items = 0
@@ -95,9 +98,9 @@ for epoch in range(10):
         _, predicted = torch.max(outputs, 1)
         corrects += (predicted == labels).sum().item()
         items += labels.size(0)
-        if i % 100 == 99:
-            accuracy = corrects / items
-            print(f'Epoch: {epoch}, Iteration: {i}, Loss: {loss.item()}, Accuracy: {accuracy}')
-            corrects = 0
-            items = 0
+        # if i % 100 == 99:
+        #     accuracy = corrects / items
+        #     print(f'Epoch: {epoch}, Iteration: {i}, Loss: {loss.item()}, Accuracy: {accuracy}')
+        #     corrects = 0
+        #     items = 0
     evaluate()

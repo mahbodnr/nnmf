@@ -5,16 +5,16 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from nnmf import DEBUG
+from torch.nn.modules.utils import _pair
 
+from . import DEBUG
 if DEBUG:
     import debug.functional as F
 
-from torch.nn.modules.utils import _pair
 
-from nnmf.utils import PowerSoftmax
-from nnmf.parameters import NonNegativeParameter
-from nnmf.autograd import FunctionalNNMFLinear, FunctionalNNMFConv2d
+from .utils import PowerSoftmax
+from .parameters import NonNegativeParameter
+from .autograd import FunctionalNNMFLinear, FunctionalNNMFConv2d
 
 
 COMPARISSON_TOLERANCE = 1e-5
@@ -156,8 +156,8 @@ class NNMFLayer(nn.Module):
             reconstruction = F.normalize(
                 reconstruction, p=1, dim=self.normalize_reconstruction_dim, eps=1e-20
             )
-        return self._forward(input / reconstruction), reconstruction # MSE model
-        # return self._forward(input - reconstruction), reconstruction
+        return self._forward(input / reconstruction), reconstruction 
+        # return self._forward(input - reconstruction), reconstruction # MSE model
 
     def _nnmf_iteration(self, input):
         nnmf_update, reconstruction = self._get_nnmf_update(input, self.h)
@@ -498,6 +498,7 @@ class NNMFConv2d(NNMFLayer):
         padding=0,
         stride=1,
         dilation=1,
+        groups=1,
         normalize_channels=False,
         backward_method="all_grads",
         convergence_threshold=0,
@@ -529,6 +530,8 @@ class NNMFConv2d(NNMFLayer):
         self.padding = _pair(padding)
         self.stride = _pair(stride)
         self.dilation = _pair(dilation)
+        assert in_channels % groups == 0, f"in_channels {in_channels} must be divisible by groups {groups}"
+        self.groups = groups
         self.n_iterations = n_iterations
         self.normalize_channels = normalize_channels
         if self.dilation != (1, 1):
@@ -538,7 +541,7 @@ class NNMFConv2d(NNMFLayer):
 
         self.weight = NonNegativeParameter(
             torch.rand(
-                out_channels, in_channels, self.kernel_size[0], self.kernel_size[1]
+                out_channels, in_channels//groups, self.kernel_size[0], self.kernel_size[1]
             )
         )
         self.convolution_contribution_map = None
@@ -562,19 +565,22 @@ class NNMFConv2d(NNMFLayer):
             weight,
             padding=self.padding,
             stride=self.stride,
+            groups=self.groups,
         )
 
     def _forward(self, nnmf_update, weight=None):
         if weight is None:
             weight = self.weight
         return F.conv2d(
-            nnmf_update, self.weight, padding=self.padding, stride=self.stride
+            nnmf_update, self.weight, padding=self.padding, stride=self.stride, groups=self.groups
         )
 
     def _process_h(self, h):
         h = self._secure_tensor(h)
         if self.normalize_channels:
-            h = F.normalize(F.relu(h), p=1, dim=1)
+            h = F.normalize(h, p=1, dim=1)
+        else:
+            h = F.normalize(h, p=1, dim=(1, 2, 3))
         return h
 
     def _reset_h(self, x):
@@ -639,16 +645,22 @@ class NNMFConv2d(NNMFLayer):
             self.padding[0],
         )
 
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}({self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+            f"n_iterations={self.n_iterations}, padding={self.padding}, stride={self.stride})"
+        )
+
 class ForwardNNMF(NNMFLayer):
-    def _reconstruct(self, h, input, weight=None):
+    def _reconstruct(self, h):
         return torch.autograd.functional.vjp(
             self._forward,
-            input,
-            self.h,
+            self.prepared_input,
+            h,
             create_graph=True,
         )[1]
 
-
+    
 class BackwardNNMF(NNMFLayer):
     def _forward(self, nnmf_update):
         return torch.autograd.functional.vjp(
