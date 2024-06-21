@@ -5,12 +5,8 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch.nn.modules.utils import _pair
-
-from . import DEBUG
-if DEBUG:
-    import debug.functional as F
-
 
 from .utils import PowerSoftmax
 from .parameters import NonNegativeParameter
@@ -28,6 +24,7 @@ class NNMFLayer(nn.Module):
         backward_method="all_grads",
         h_update_rate=1,
         keep_h=False,
+        trainable_h= False,
         activate_secure_tensors=True,
         return_reconstruction=False,
         convergence_threshold=0,
@@ -80,6 +77,10 @@ class NNMFLayer(nn.Module):
                 "[WARNING] normalize_reconstruction is True but normalize_reconstruction_dim is None! This will normalize the entire reconstruction tensor (including batch dimension)"
             )
         self.h = None
+        self.trainable_h = trainable_h
+        if self.trainable_h:
+            self.h = NonNegativeParameter(None)
+            self.initialized_h = False
         self.reconstruction = None
         self.convergence = None
         self.reconstruction_mse = None
@@ -99,6 +100,14 @@ class NNMFLayer(nn.Module):
     def normalize_weights(self):
         raise NotImplementedError
 
+    @torch.no_grad()
+    def _reset_trainable_h(self, h_shape, device):
+        if not self.initialized_h:
+            self.h.data = torch.ones(h_shape[1:]).unsqueeze(0).to(device)
+            self.initialized_h = True
+        else:
+            self._secure_tensor(self.h)
+            
     @abstractmethod
     def _reset_h(self, x):
         raise NotImplementedError
@@ -156,17 +165,17 @@ class NNMFLayer(nn.Module):
             reconstruction = F.normalize(
                 reconstruction, p=1, dim=self.normalize_reconstruction_dim, eps=1e-20
             )
-        return self._forward(input / reconstruction), reconstruction 
+        return self._forward(input / reconstruction), reconstruction
         # return self._forward(input - reconstruction), reconstruction # MSE model
 
-    def _nnmf_iteration(self, input):
-        nnmf_update, reconstruction = self._get_nnmf_update(input, self.h)
-        new_h = self.h * nnmf_update
+    def _nnmf_iteration(self, input, h):
+        nnmf_update, reconstruction = self._get_nnmf_update(input, h)
+        new_h = h * nnmf_update
         # new_h = self.h + nnmf_update # MSE model
         if self.h_update_rate == 1:
             h = new_h
         else:
-            h = self.h_update_rate * new_h + (1 - self.h_update_rate) * self.h
+            h = self.h_update_rate * new_h + (1 - self.h_update_rate) * h
         return self._process_h(h), self._process_reconstruction(reconstruction)
 
     def _prepare_input(self, input):
@@ -174,12 +183,12 @@ class NNMFLayer(nn.Module):
             input = F.normalize(input, p=1, dim=self.normalize_input_dim, eps=1e-20)
         return input
 
-    def _forward_iteration(self, input):
+    def _forward_iteration(self, input, h):
         self.forward_iterations += 1
-        new_h, self.reconstruction = self._nnmf_iteration(input)
-        self.convergence.append(F.mse_loss(new_h, self.h))
-        self.reconstruction_mse.append(F.mse_loss(self.reconstruction, input))
-        self.h = new_h
+        new_h, self.reconstruction = self._nnmf_iteration(input, h)
+        # self.convergence.append(F.mse_loss(new_h, h))
+        # self.reconstruction_mse.append(F.mse_loss(self.reconstruction, input))
+        return new_h
 
     def forward(self, input):
         self.normalize_weights()
@@ -197,7 +206,7 @@ class NNMFLayer(nn.Module):
         self.forward_iterations = 0
         if self.backward_method == "all_grads":
             for i in range(self.n_iterations):
-                self._forward_iteration(input)
+                new_h = self._forward_iteration(input, self.h)
                 if (
                     self.convergence_threshold > 0
                     and self.convergence[-1] < self.convergence_threshold
@@ -239,14 +248,14 @@ class NNMFLayer(nn.Module):
                 #         "return_reconstruction not implemented for backward_method 'implicit'"
                 #     )
                 self.forward_iterations += 1
-                self.h = self.h.requires_grad_()
-                self.h, self.reconstruction = self._nnmf_iteration(input)
-                jacobian = self.jacobian(input, self.h)
+                new_h = new_h.requires_grad_()
+                new_h, self.reconstruction = self._nnmf_iteration(input, new_h)
+                jacobian = self.jacobian(input, new_h)
 
                 if self.hook is not None:
                     self.hook.remove()
                     torch.cuda.synchronize()
-                self.hook = self.h.register_hook(
+                self.hook = new_h.register_hook(
                     lambda grad: torch.linalg.solve(
                         A=jacobian.transpose(-1, -2),
                         B=grad.reshape(grad.shape[0], -1),
@@ -267,42 +276,46 @@ class NNMFLayer(nn.Module):
                         break
 
             if self.training:
+                h = new_h.clone()
                 for _ in range(self.unrolling_steps):
                     self.forward_iterations += 1
-                    new_h, new_reconstruction = self._nnmf_iteration(input)
+                    new_h, new_reconstruction = self._nnmf_iteration(input, h)
                     new_h = (
                         self.phantom_damping_factor * new_h
-                        + (1 - self.phantom_damping_factor) * self.h
+                        + (1 - self.phantom_damping_factor) * h
                     )
                     new_reconstruction = (
                         self.phantom_damping_factor * new_reconstruction
                         + (1 - self.phantom_damping_factor) * self.reconstruction
                     )
-                    self.convergence.append(F.mse_loss(new_h, self.h))
+                    self.convergence.append(F.mse_loss(new_h, h))
                     self.reconstruction_mse.append(
                         F.mse_loss(self.reconstruction, input)
                     )
-                    self.h = new_h
                     self.reconstruction = new_reconstruction
 
         elif self.backward_method == "david":
-            self.h = self.david_backprop(
+            new_h = self.david_backprop(
                 input,
                 self.h,
                 self.n_iterations,
             )
-            self.reconstruction = self._reconstruct(self.h)
+            self.reconstruction = self._reconstruct(new_h)
 
         else:
             raise NotImplementedError(
                 f"backward_method {self.backward_method} not implemented"
             )
 
-        if self.return_reconstruction:
-            return self.h, self.reconstruction
-        else:
-            return self.h
+        if self.keep_h:
+            assert not self.trainable_h, "trainable_h not implemented for keep_h"
+            self.h = new_h
 
+        if self.return_reconstruction:
+            return new_h, self.reconstruction
+        else:
+            return new_h
+        
     @abstractmethod
     def david_backprop(self, input, h, n_iterations):
         raise NotImplementedError("David backprop not implemented for this layer")
@@ -316,6 +329,7 @@ class NNMFLayerDynamicWeight(NNMFLayer):
         h_update_rate=1,
         w_update_rate=1,
         keep_h=False,
+        trainable_h= False,
         activate_secure_tensors=True,
         return_reconstruction=False,
         convergence_threshold=0,
@@ -330,6 +344,7 @@ class NNMFLayerDynamicWeight(NNMFLayer):
             backward_method=backward_method,
             h_update_rate=h_update_rate,
             keep_h=keep_h,
+            trainable_h=trainable_h,
             activate_secure_tensors=activate_secure_tensors,
             return_reconstruction=return_reconstruction,
             convergence_threshold=convergence_threshold,
@@ -364,6 +379,7 @@ class NNMFDense(NNMFLayer):
         convergence_threshold=0,
         h_update_rate=1,
         keep_h=False,
+        trainable_h= False,
         activate_secure_tensors=True,
         return_reconstruction=False,
         normalize_input=True,
@@ -376,6 +392,7 @@ class NNMFDense(NNMFLayer):
             backward_method,
             h_update_rate,
             keep_h,
+            trainable_h,
             activate_secure_tensors,
             return_reconstruction,
             convergence_threshold=convergence_threshold,
@@ -397,7 +414,11 @@ class NNMFDense(NNMFLayer):
 
     def _reset_h(self, x):
         h_shape = x.shape[:-1] + (self.out_features,)
-        self.h = F.normalize(torch.ones(h_shape), p=1, dim=1).to(x.device)
+        if self.trainable_h:
+            self._reset_trainable_h(h_shape, x.device)
+        else:
+            self.h = torch.ones(h_shape).to(x.device)
+        self.h.data = self._process_h(self.h)
 
     def _reconstruct(self, h, weight=None):
         if weight is None:
@@ -504,6 +525,7 @@ class NNMFConv2d(NNMFLayer):
         convergence_threshold=0,
         h_update_rate=1,
         keep_h=False,
+        trainable_h= False,
         activate_secure_tensors=True,
         return_reconstruction=False,
         normalize_input=True,
@@ -516,6 +538,7 @@ class NNMFConv2d(NNMFLayer):
             backward_method,
             h_update_rate,
             keep_h,
+            trainable_h,
             activate_secure_tensors,
             return_reconstruction,
             convergence_threshold=convergence_threshold,
@@ -530,7 +553,9 @@ class NNMFConv2d(NNMFLayer):
         self.padding = _pair(padding)
         self.stride = _pair(stride)
         self.dilation = _pair(dilation)
-        assert in_channels % groups == 0, f"in_channels {in_channels} must be divisible by groups {groups}"
+        assert (
+            in_channels % groups == 0
+        ), f"in_channels {in_channels} must be divisible by groups {groups}"
         self.groups = groups
         self.n_iterations = n_iterations
         self.normalize_channels = normalize_channels
@@ -541,7 +566,10 @@ class NNMFConv2d(NNMFLayer):
 
         self.weight = NonNegativeParameter(
             torch.rand(
-                out_channels, in_channels//groups, self.kernel_size[0], self.kernel_size[1]
+                out_channels,
+                in_channels // groups,
+                self.kernel_size[0],
+                self.kernel_size[1],
             )
         )
         self.convolution_contribution_map = None
@@ -555,7 +583,7 @@ class NNMFConv2d(NNMFLayer):
         normalized_weight = F.normalize(self.weight.data, p=1, dim=(1, 2, 3))
         self.weight.data = F.normalize(
             normalized_weight.clamp(min=SECURE_TENSOR_MIN), p=1, dim=(1, 2, 3)
-        )
+        )  # / self.groups
 
     def _reconstruct(self, h, weight=None):
         if weight is None:
@@ -572,7 +600,11 @@ class NNMFConv2d(NNMFLayer):
         if weight is None:
             weight = self.weight
         return F.conv2d(
-            nnmf_update, self.weight, padding=self.padding, stride=self.stride, groups=self.groups
+            nnmf_update,
+            self.weight,
+            padding=self.padding,
+            stride=self.stride,
+            groups=self.groups,
         )
 
     def _process_h(self, h):
@@ -604,10 +636,19 @@ class NNMFConv2d(NNMFLayer):
             raise ValueError(
                 f"Reconstruction size {reconstruct_size} does not match input size {list(x.shape[-2:])}. Use ForwardNNMFConv2d instead"
             )
-        self.h = torch.ones(x.shape[0], self.out_channels, *self.output_size).to(x.device)
+        
+        h_shape = [x.shape[0], self.out_channels, *self.output_size]
+        if self.trainable_h:
+            self._reset_trainable_h(h_shape, x.device)
+        else:
+            self.h = torch.ones(h_shape).to(x.device)
+
+        self.h.data = self._process_h(self.h)
 
     def _check_forward(self, input):
-        assert self.weight.sum((1, 2, 3), keepdim=True).allclose(
+        assert (
+            self.weight.sum((1, 2, 3), keepdim=True) #* self.groups
+        ).allclose(
             torch.ones_like(self.weight), atol=COMPARISSON_TOLERANCE
         ), self.weight.sum((1, 2, 3))
         assert (self.weight >= 0).all(), self.weight.min()
@@ -651,6 +692,7 @@ class NNMFConv2d(NNMFLayer):
             f"n_iterations={self.n_iterations}, padding={self.padding}, stride={self.stride})"
         )
 
+
 class ForwardNNMF(NNMFLayer):
     def _reconstruct(self, h):
         return torch.autograd.functional.vjp(
@@ -660,7 +702,7 @@ class ForwardNNMF(NNMFLayer):
             create_graph=True,
         )[1]
 
-    
+
 class BackwardNNMF(NNMFLayer):
     def _forward(self, nnmf_update):
         return torch.autograd.functional.vjp(
@@ -684,6 +726,7 @@ class LocalNNMFLayer(NNMFLayer):
         backward_method="all_grads",
         h_update_rate=1,
         keep_h=False,
+        trainable_h= False,
         activate_secure_tensors=True,
         return_reconstruction=False,
         convergence_threshold=0,
@@ -699,6 +742,7 @@ class LocalNNMFLayer(NNMFLayer):
             backward_method,
             h_update_rate,
             keep_h,
+            trainable_h,
             activate_secure_tensors,
             return_reconstruction,
             convergence_threshold=convergence_threshold,
@@ -724,6 +768,7 @@ class LocalNNMFDense(LocalNNMFLayer, NNMFDense):
         w_update_rate=1,
         h_update_rate=1,
         keep_h=False,
+        trainable_h= False,
         activate_secure_tensors=True,
         return_reconstruction=False,
         convergence_threshold=0,
@@ -739,6 +784,7 @@ class LocalNNMFDense(LocalNNMFLayer, NNMFDense):
             n_iterations=n_iterations,
             h_update_rate=h_update_rate,
             keep_h=keep_h,
+            trainable_h=trainable_h,
             activate_secure_tensors=activate_secure_tensors,
             return_reconstruction=return_reconstruction,
             convergence_threshold=convergence_threshold,
@@ -747,7 +793,9 @@ class LocalNNMFDense(LocalNNMFLayer, NNMFDense):
             normalize_reconstruction=normalize_reconstruction,
             normalize_reconstruction_dim=normalize_reconstruction_dim,
         )
-        self.weight = NonNegativeParameter(torch.rand(out_features, in_features), requires_grad=False)
+        self.weight = NonNegativeParameter(
+            torch.rand(out_features, in_features), requires_grad=False
+        )
         self.w_update_rate = w_update_rate
 
     @torch.no_grad()
